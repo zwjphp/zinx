@@ -10,7 +10,7 @@ import (
 
 /*
 链接模块
- */
+*/
 type Connection struct {
 	//当前链接的socket TCP套接字
 	Conn *net.TCPConn
@@ -24,13 +24,16 @@ type Connection struct {
 	// 告知当前链接已经推出的/停止 channel
 	ExitChan chan bool
 
+	// 无缓冲的管道，用于读、写Goroutine之间的消息通讯
+	MsgChan chan []byte
+
 	// 消息的管理MsgID 和对应的处理业务API关系
 	MsgHandler ziface.IMsgHandle
 }
 
-func (c *Connection)StartReader() {
+func (c *Connection) StartReader() {
 	fmt.Println(" Reader Goroutine is running..")
-	defer fmt.Println("connID = ", c.ConnID, " Reader is exit, remote addr is ",nil)
+	defer fmt.Println("[Reader is exit], connID = ", c.ConnID, " remote addr is ", c.RemoteAddr())
 	defer c.Stop()
 
 	for {
@@ -47,7 +50,7 @@ func (c *Connection)StartReader() {
 
 		//读取客户端的Msg Head 二级制流 8个字节
 		headData := make([]byte, dp.GetHeadLen())
-		if _, err := io.ReadFull(c.GetTCPConnection(), headData);err != nil {
+		if _, err := io.ReadFull(c.GetTCPConnection(), headData); err != nil {
 			fmt.Println("read msg head error", err)
 			break
 		}
@@ -73,7 +76,7 @@ func (c *Connection)StartReader() {
 		//得到当前conn数据的Request请求数据
 		req := Request{
 			conn: c,
-			msg: msg,
+			msg:  msg,
 		}
 
 		//从路由中， 找到注册绑定的Conn对应的router调用
@@ -82,10 +85,35 @@ func (c *Connection)StartReader() {
 	}
 }
 
+/*
+	写消息Goroutine，专门发送给客户端消息的模块
+ */
+func (c *Connection) StartWriter() {
+	fmt.Println("[Writer Cortine is running]")
+	defer fmt.Println( " [conn Writer exit!]  remote addr is ", c.RemoteAddr())
+
+	// 不断的阻塞的等待channel的消息，进行写给客户端
+	for {
+		select {
+		case data := <-c.MsgChan:
+			//有数据写给客户端
+			if _, err := c.Conn.Write(data); err != nil {
+				fmt.Println("Send data error, ", err)
+				return
+			}
+		case <-c.ExitChan:
+			//代表Reader已经推出， 此时Writer也要推出
+			return
+		}
+	}
+}
+
 func (c *Connection) Start() {
 	fmt.Println("Conn Start() ... ConnID = ", c.ConnID)
 	// 启动从当前链接的读数据的业务
 	go c.StartReader()
+	// 启动从当前链接的写数据的业务
+	go c.StartWriter()
 }
 
 //停止链接 结束当前链接的工作
@@ -100,7 +128,11 @@ func (c *Connection) Stop() {
 	//关闭socket链接
 	c.Conn.Close()
 
+	// 告知writer退出
+	c.ExitChan <- true
+	// 回收资源
 	close(c.ExitChan)
+	close(c.MsgChan)
 }
 
 func (c *Connection) GetTCPConnection() *net.TCPConn {
@@ -123,11 +155,12 @@ func (c *Connection) Send(data []byte) error {
 //初始化链接模块的方法
 func NewConnection(conn *net.TCPConn, connID uint32, msgHandle ziface.IMsgHandle) *Connection {
 	c := &Connection{
-		Conn:      conn,
-		ConnID:    connID,
-		isClosed:  false,
+		Conn:       conn,
+		ConnID:     connID,
 		MsgHandler: msgHandle,
-		ExitChan:  make(chan bool, 1),
+		isClosed:   false,
+		MsgChan:    make(chan []byte),
+		ExitChan:   make(chan bool, 1),
 	}
 
 	return c
@@ -148,28 +181,7 @@ func (c *Connection) SendMsg(msgId uint32, data []byte) error {
 	}
 
 	// 将数据发送给客户端
-	if _, err := c.Conn.Write(binaryMsg); err != nil {
-		fmt.Println("Write msg id ", msgId, " error :", err )
-		return errors.New("conn Write error")
-	}
+	c.MsgChan <- binaryMsg
 
 	return nil
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
